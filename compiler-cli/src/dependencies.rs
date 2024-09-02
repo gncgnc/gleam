@@ -106,6 +106,100 @@ zzz 0.4.0
     )
 }
 
+/// TODO document
+pub fn why(package_name: String) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().expect("Unable to start Tokio async runtime");
+    let project = fs::get_project_root(fs::get_current_directory()?)?;
+    let paths = ProjectPaths::new(project);
+    let config = crate::config::root_config()?;
+    let (_, manifest) = get_manifest(
+        &paths,
+        runtime.handle().clone(),
+        Mode::Dev,
+        &config,
+        &cli::Reporter::new(),
+        UseManifest::Yes,
+    )?;
+    list_inverse_deps(std::io::stdout(), config, manifest, &package_name)
+}
+
+/// TODO document
+fn list_inverse_deps<W: std::io::Write>(
+    mut buffer: W,
+    config: PackageConfig,
+    manifest: Manifest,
+    dep_name: &str,
+) -> Result<()> {
+    #[derive(Clone)]
+    struct Package {
+        name: EcoString,
+        requirements: Vec<EcoString>,
+    }
+
+    // collect root packages
+    let dependencies = config.dependencies_for(Mode::Dev)?;
+    let root_package = Package {
+        name: config.name.clone(),
+        requirements: dependencies.keys().cloned().collect(),
+    };
+
+    let hex_packages = manifest
+        .packages
+        .into_iter()
+        .filter(|mp| matches!(mp.source, ManifestPackageSource::Hex { .. }))
+        .map(|mp| Package {
+            name: mp.name,
+            requirements: mp.requirements,
+        });
+
+    let packages = hex_packages
+        .into_iter()
+        .chain(std::iter::once(root_package.clone()))
+        .collect_vec();
+
+    fn traverse<W: std::io::Write>(
+        buffer: &mut W,
+        dep_name: &str,
+        package: &Package,
+        path: &mut Vec<EcoString>,
+        packages: &[Package],
+    ) -> Result<()> {
+        path.push(package.name.clone());
+        for name in &package.requirements {
+            if name == dep_name {
+                // write dependency chain
+                for package_name in &*path {
+                    write!(buffer, "{package_name} > ").map_err(|e| Error::StandardIo {
+                        action: StandardIoAction::Write,
+                        err: Some(e.kind()),
+                    })?
+                }
+                writeln!(buffer, "{dep_name}").map_err(|e| Error::StandardIo {
+                    action: StandardIoAction::Write,
+                    err: Some(e.kind()),
+                })?;
+            } else {
+                traverse(
+                    buffer,
+                    dep_name,
+                    packages
+                        .iter()
+                        .find(|p| p.name == *name)
+                        .expect("Couldn't find dependency"),
+                    path,
+                    packages,
+                )?;
+            }
+        }
+        let _ = path.pop();
+
+        Ok(())
+    }
+
+    traverse(&mut buffer, dep_name, &root_package, &mut vec![], &packages)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum UseManifest {
     Yes,
