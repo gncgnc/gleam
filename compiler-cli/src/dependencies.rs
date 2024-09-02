@@ -106,6 +106,30 @@ zzz 0.4.0
     )
 }
 
+pub fn why(package_name: String) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().expect("Unable to start Tokio async runtime");
+    let project = fs::get_project_root(fs::get_current_directory()?)?;
+    let paths = ProjectPaths::new(project);
+    let config = crate::config::root_config()?;
+    let (_, manifest) = get_manifest(
+        &paths,
+        runtime.handle().clone(),
+        Mode::Dev,
+        &config,
+        &cli::Reporter::new(),
+        UseManifest::Yes,
+    )?;
+    list_inverse_deps(std::io::stdout(), manifest, &package_name)
+}
+
+fn list_inverse_deps<W: std::io::Write>(
+    mut buffer: W,
+    manifest: Manifest,
+    package_name: &str,
+) -> Result<()> {
+    todo!()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum UseManifest {
     Yes,
