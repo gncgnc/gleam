@@ -16,7 +16,7 @@ use gleam_core::{
     io::{HttpClient as _, TarUnpacker, WrappedReader},
     manifest::{Base16Checksum, Manifest, ManifestPackage, ManifestPackageSource},
     paths::ProjectPaths,
-    requirement::Requirement,
+    requirement::{self, Requirement},
     Error, Result,
 };
 use hexpm::version::Version;
@@ -135,46 +135,48 @@ fn list_inverse_deps_with_required_version<W: std::io::Write>(
     manifest: Manifest,
     dep_name: &str,
 ) -> Result<()> {
+    // TODO root deps
+
+    // find packages that depend on dep
     let inverse_deps = manifest
         .packages
         .into_iter()
         .filter(|package| package.requirements.contains(&dep_name.into()))
         .collect_vec();
 
-    let inverse_deps_with_required_versions = runtime.block_on(future::try_join_all(
+    // fetch package releases from hex
+    let inverse_dep_packages = runtime.block_on(future::try_join_all(
         inverse_deps.into_iter().map(|package| async move {
             let config = hexpm::Config::new();
-            let release = hex::get_package_release(
-                &package.name,
-                &package.version,
-                &config,
-                &HttpClient::new(),
-            )
-            .await?;
-
-            let res: Result<_> = Ok(release
-                .requirements
-                .iter()
-                .find_map(|(name, dep)| {
-                    (*dep_name == **name).then_some((
-                        package.name.clone(),
-                        EcoString::from(dep.requirement.as_str()),
-                    ))
-                })
-                .expect("Expected dep to be dependency of package"));
-            res
+            hex::get_package_release(&package.name, &package.version, &config, &HttpClient::new())
+                .await
+                .map(|release| (package.name, release))
         }),
     ))?;
 
-    inverse_deps_with_required_versions
-        .iter()
-        .try_for_each(|(package_name, required_version)| {
-            writeln!(buffer, "{package_name} needs {required_version}")
-        })
+    //
+    for (package_name, release) in inverse_dep_packages {
+        // get version requirement string
+        let required_version = release
+            .requirements
+            .iter()
+            .find_map(|(name, dep)| {
+                (*dep_name == **name).then_some(EcoString::from(dep.requirement.as_str()))
+            })
+            .expect("Expected dep to be dependency of package");
+        let package_version = release.version;
+
+        writeln!(
+            buffer,
+            "{package_name} {package_version} requires {required_version}"
+        )
         .map_err(|e| Error::StandardIo {
             action: StandardIoAction::Write,
             err: Some(e.kind()),
-        })
+        })?
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
