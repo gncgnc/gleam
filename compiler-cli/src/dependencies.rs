@@ -106,6 +106,7 @@ zzz 0.4.0
     )
 }
 
+/// TODO document
 pub fn why(package_name: String) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().expect("Unable to start Tokio async runtime");
     let project = fs::get_project_root(fs::get_current_directory()?)?;
@@ -119,15 +120,61 @@ pub fn why(package_name: String) -> Result<()> {
         &cli::Reporter::new(),
         UseManifest::Yes,
     )?;
-    list_inverse_deps(std::io::stdout(), manifest, &package_name)
+    list_inverse_deps_with_required_version(
+        runtime.handle().clone(),
+        std::io::stdout(),
+        manifest,
+        &package_name,
+    )
 }
 
-fn list_inverse_deps<W: std::io::Write>(
+/// TODO document
+fn list_inverse_deps_with_required_version<W: std::io::Write>(
+    runtime: tokio::runtime::Handle,
     mut buffer: W,
     manifest: Manifest,
-    package_name: &str,
+    dep_name: &str,
 ) -> Result<()> {
-    todo!()
+    let inverse_deps = manifest
+        .packages
+        .into_iter()
+        .filter(|package| package.requirements.contains(&dep_name.into()))
+        .collect_vec();
+
+    let inverse_deps_with_required_versions = runtime.block_on(future::try_join_all(
+        inverse_deps.into_iter().map(|package| async move {
+            let config = hexpm::Config::new();
+            let release = hex::get_package_release(
+                &package.name,
+                &package.version,
+                &config,
+                &HttpClient::new(),
+            )
+            .await?;
+
+            let res: Result<_> = Ok(release
+                .requirements
+                .iter()
+                .find_map(|(name, dep)| {
+                    (*dep_name == **name).then_some((
+                        package.name.clone(),
+                        EcoString::from(dep.requirement.as_str()),
+                    ))
+                })
+                .expect("Expected dep to be dependency of package"));
+            res
+        }),
+    ))?;
+
+    inverse_deps_with_required_versions
+        .iter()
+        .try_for_each(|(package_name, required_version)| {
+            writeln!(buffer, "{package_name} needs {required_version}")
+        })
+        .map_err(|e| Error::StandardIo {
+            action: StandardIoAction::Write,
+            err: Some(e.kind()),
+        })
 }
 
 #[derive(Debug, Clone, Copy)]
