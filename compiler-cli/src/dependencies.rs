@@ -16,7 +16,7 @@ use gleam_core::{
     io::{HttpClient as _, TarUnpacker, WrappedReader},
     manifest::{Base16Checksum, Manifest, ManifestPackage, ManifestPackageSource},
     paths::ProjectPaths,
-    requirement::{self, Requirement},
+    requirement::Requirement,
     Error, Result,
 };
 use hexpm::version::Version;
@@ -123,6 +123,7 @@ pub fn why(package_name: String) -> Result<()> {
     list_inverse_deps_with_required_version(
         runtime.handle().clone(),
         std::io::stdout(),
+        config,
         manifest,
         &package_name,
     )
@@ -132,10 +133,29 @@ pub fn why(package_name: String) -> Result<()> {
 fn list_inverse_deps_with_required_version<W: std::io::Write>(
     runtime: tokio::runtime::Handle,
     mut buffer: W,
+    config: PackageConfig,
     manifest: Manifest,
     dep_name: &str,
 ) -> Result<()> {
-    // TODO root deps
+    // collect root deps if there is a direct dependency
+    let root_deps = config.all_drect_dependencies()?;
+    let inverse_root_deps = root_deps
+        .iter()
+        .any(|(name, _)| *dep_name == *name.as_str())
+        .then_some((
+            config.name.clone(),
+            root_deps
+                .into_iter()
+                .filter_map(|(name, req)| {
+                    if let Requirement::Hex { version } = req {
+                        Some((name, version))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<HashMap<_, _>>(),
+            config.version,
+        ));
 
     // find packages that depend on dep
     let inverse_deps = manifest
@@ -144,31 +164,39 @@ fn list_inverse_deps_with_required_version<W: std::io::Write>(
         .filter(|package| package.requirements.contains(&dep_name.into()))
         .collect_vec();
 
-    // fetch package releases from hex
+    // fetch package releases from hex for version requirements
     let inverse_dep_packages = runtime.block_on(future::try_join_all(
         inverse_deps.into_iter().map(|package| async move {
             let config = hexpm::Config::new();
             hex::get_package_release(&package.name, &package.version, &config, &HttpClient::new())
                 .await
-                .map(|release| (package.name, release))
+                .map(|release| {
+                    (
+                        package.name,
+                        release
+                            .requirements
+                            .into_iter()
+                            .map(|(k, v)| (EcoString::from(k), v.requirement))
+                            .collect::<HashMap<_, _>>(),
+                        release.version,
+                    )
+                })
         }),
     ))?;
 
-    //
-    for (package_name, release) in inverse_dep_packages {
+    for (package_name, requirements, version) in inverse_dep_packages
+        .into_iter()
+        .chain(inverse_root_deps.into_iter())
+    {
         // get version requirement string
-        let required_version = release
-            .requirements
+        let required_version = requirements
             .iter()
-            .find_map(|(name, dep)| {
-                (*dep_name == **name).then_some(EcoString::from(dep.requirement.as_str()))
-            })
+            .find_map(|(name, dep)| (*dep_name == **name).then_some(EcoString::from(dep.as_str())))
             .expect("Expected dep to be dependency of package");
-        let package_version = release.version;
 
         writeln!(
             buffer,
-            "{package_name} {package_version} requires {required_version}"
+            "{package_name} {version} requires {required_version}"
         )
         .map_err(|e| Error::StandardIo {
             action: StandardIoAction::Write,
