@@ -125,6 +125,7 @@ pub fn why(package_name: String) -> Result<()> {
         std::io::stdout(),
         config,
         manifest,
+        &paths,
         &package_name,
     )
 }
@@ -135,107 +136,127 @@ fn list_inverse_deps_with_required_version<W: std::io::Write>(
     mut buffer: W,
     config: PackageConfig,
     manifest: Manifest,
+    project_paths: &ProjectPaths,
     dep_name: &str,
 ) -> Result<()> {
-    // collect root deps
-    let root_deps = config.all_drect_dependencies()?;
-    let inverse_root_deps = (
-        config.name.clone(),
-        root_deps
-            .clone()
-            .into_iter()
-            .filter_map(|(name, req)| match req {
-                Requirement::Hex { version } => Some((name, version)),
-                Requirement::Path { .. } | Requirement::Git { .. } => None, /* TODO? */
-            })
-            .collect_vec(),
-        config.version.clone(),
-    );
+    let dependencies = config.dependencies_for(Mode::Dev)?;
 
-    // find packages that depend on dep
-    let inverse_deps = manifest.packages;
+    // Packages which are provided directly instead of downloaded from hex
+    let mut provided_packages = HashMap::new();
+    // The version requires of the current project
+    let mut root_requirements = HashMap::new();
+
+    // Populate the provided_packages and root_requirements maps
+    for (name, requirement) in dependencies.into_iter() {
+        let version = match requirement {
+            Requirement::Hex { version } => version,
+            Requirement::Path { path } => provide_local_package(
+                name.clone(),
+                &path,
+                project_paths.root(),
+                project_paths,
+                &mut provided_packages,
+                &mut vec![],
+            )?,
+            Requirement::Git { git } => {
+                provide_git_package(name.clone(), &git, project_paths, &mut provided_packages)?
+            }
+        };
+        let _ = root_requirements.insert(name, version);
+    }
+
+    #[derive(Clone)]
+    struct Package {
+        name: EcoString,
+        requirements: Vec<(EcoString, hexpm::version::Range)>,
+        version: Version,
+    }
+
+    // collect root packages
+    let root_package = Package {
+        name: config.name.clone(),
+        requirements: root_requirements.into_iter().collect_vec(),
+        version: config.version.clone(),
+    };
 
     // fetch package releases from hex for version requirements
-    let inverse_dep_packages = runtime.block_on(future::try_join_all(
-        inverse_deps.into_iter().map(|package| async move {
-            let hex_config = hexpm::Config::new();
-            hex::get_package_release(
-                &package.name,
-                &package.version,
-                &hex_config,
-                &HttpClient::new(),
-            )
-            .await
-            .map(|release| (package, release))
-        }),
+    let hex_packages = runtime.block_on(future::try_join_all(
+        manifest
+            .packages
+            .into_iter()
+            .filter(|mp| matches!(mp.source, ManifestPackageSource::Hex { .. }))
+            .map(|package| async move {
+                let hex_config = hexpm::Config::new();
+                hex::get_package_release(
+                    &package.name,
+                    &package.version,
+                    &hex_config,
+                    &HttpClient::new(),
+                )
+                .await
+                .map(|release| Package {
+                    name: package.name,
+                    requirements: release
+                        .requirements
+                        .into_iter()
+                        .map(|(name, dep)| (name.into(), dep.requirement))
+                        .collect(),
+                    version: release.version,
+                })
+            }),
     ))?;
-    let inverse_dep_packages = inverse_dep_packages.into_iter().map(|(package, release)| {
-        (
-            package.name,
-            release
-                .requirements
-                .into_iter()
-                .map(|(n, v)| (n.into(), v.requirement))
-                .collect_vec(),
-            release.version,
-        )
-    });
 
-    let all_inverse_deps = inverse_dep_packages
+    let packages = hex_packages
         .into_iter()
-        .chain(std::iter::once(inverse_root_deps.clone()))
+        .chain(std::iter::once(root_package.clone()))
         .collect_vec();
 
-    type InverseDep = (EcoString, Vec<(EcoString, hexpm::version::Range)>, Version);
+    fn write_reason<W: std::io::Write>(
+        buffer: &mut W,
+        path: &[(EcoString, Version)],
+        requirement: &hexpm::version::Range,
+        dep_name: &str,
+    ) -> Result<()> {
+        let err = |io_error: std::io::Error| Error::StandardIo {
+            action: StandardIoAction::Write,
+            err: Some(io_error.kind()),
+        };
+        for (package_name, package_version) in path {
+            write!(buffer, "{package_name} {package_version} > ").map_err(err)?
+        }
+        writeln!(buffer, "{dep_name} : {}", requirement.as_str()).map_err(err)
+    }
+
     fn traverse<W: std::io::Write>(
         buffer: &mut W,
         dep_name: &str,
-        package: &InverseDep,
+        package: &Package,
         path: &mut Vec<(EcoString, Version)>,
-        all_inverse_deps: &[InverseDep],
+        packages: &[Package],
     ) -> Result<()> {
-        let (name, deps, version) = package;
-        path.push((name.clone(), version.clone()));
-        for (name, req) in deps {
+        path.push((package.name.clone(), package.version.clone()));
+        for (name, req) in &package.requirements {
             if name == dep_name {
-                for (package_name, package_version) in &*path {
-                    write!(buffer, "{package_name}={package_version} > ").map_err(|e| {
-                        Error::StandardIo {
-                            action: StandardIoAction::Write,
-                            err: Some(e.kind()),
-                        }
-                    })?
-                }
-                writeln!(buffer, "{dep_name} : {}", req.as_str()).map_err(|e| {
-                    Error::StandardIo {
-                        action: StandardIoAction::Write,
-                        err: Some(e.kind()),
-                    }
-                })?
+                write_reason(buffer, path, req, dep_name)?;
             } else {
                 traverse(
                     buffer,
                     dep_name,
-                    all_inverse_deps
+                    packages
                         .iter()
-                        .find(|(pn, _, _)| pn == name)
-                        .expect("to find dependency"),
+                        .find(|p| p.name == *name)
+                        .expect("Couldn't find dependency"),
                     path,
-                    all_inverse_deps,
+                    packages,
                 )?;
             }
         }
         let _ = path.pop();
+
         Ok(())
     }
 
-    traverse(
-        &mut buffer,
-        dep_name,
-        &inverse_root_deps,
-        &mut vec![],
-        &all_inverse_deps,
-    )?;
+    traverse(&mut buffer, dep_name, &root_package, &mut vec![], &packages)?;
     Ok(())
 }
 
