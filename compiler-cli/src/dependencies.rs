@@ -137,73 +137,105 @@ fn list_inverse_deps_with_required_version<W: std::io::Write>(
     manifest: Manifest,
     dep_name: &str,
 ) -> Result<()> {
-    // collect root deps if there is a direct dependency
+    // collect root deps
     let root_deps = config.all_drect_dependencies()?;
-    let inverse_root_deps = root_deps
-        .iter()
-        .any(|(name, _)| *dep_name == *name.as_str())
-        .then_some((
-            config.name.clone(),
-            root_deps
-                .into_iter()
-                .filter_map(|(name, req)| {
-                    if let Requirement::Hex { version } = req {
-                        Some((name, version))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<HashMap<_, _>>(),
-            config.version,
-        ));
+    let inverse_root_deps = (
+        config.name.clone(),
+        root_deps
+            .clone()
+            .into_iter()
+            .filter_map(|(name, req)| match req {
+                Requirement::Hex { version } => Some((name, version)),
+                Requirement::Path { .. } | Requirement::Git { .. } => None, /* TODO? */
+            })
+            .collect_vec(),
+        config.version.clone(),
+    );
 
     // find packages that depend on dep
-    let inverse_deps = manifest
-        .packages
-        .into_iter()
-        .filter(|package| package.requirements.contains(&dep_name.into()))
-        .collect_vec();
+    let inverse_deps = manifest.packages;
 
     // fetch package releases from hex for version requirements
     let inverse_dep_packages = runtime.block_on(future::try_join_all(
         inverse_deps.into_iter().map(|package| async move {
-            let config = hexpm::Config::new();
-            hex::get_package_release(&package.name, &package.version, &config, &HttpClient::new())
-                .await
-                .map(|release| {
-                    (
-                        package.name,
-                        release
-                            .requirements
-                            .into_iter()
-                            .map(|(k, v)| (EcoString::from(k), v.requirement))
-                            .collect::<HashMap<_, _>>(),
-                        release.version,
-                    )
-                })
+            let hex_config = hexpm::Config::new();
+            hex::get_package_release(
+                &package.name,
+                &package.version,
+                &hex_config,
+                &HttpClient::new(),
+            )
+            .await
+            .map(|release| (package, release))
         }),
     ))?;
-
-    for (package_name, requirements, version) in inverse_dep_packages
-        .into_iter()
-        .chain(inverse_root_deps.into_iter())
-    {
-        // get version requirement string
-        let required_version = requirements
-            .iter()
-            .find_map(|(name, dep)| (*dep_name == **name).then_some(EcoString::from(dep.as_str())))
-            .expect("Expected dep to be dependency of package");
-
-        writeln!(
-            buffer,
-            "{package_name} {version} requires {required_version}"
+    let inverse_dep_packages = inverse_dep_packages.into_iter().map(|(package, release)| {
+        (
+            package.name,
+            release
+                .requirements
+                .into_iter()
+                .map(|(n, v)| (n.into(), v.requirement))
+                .collect_vec(),
+            release.version,
         )
-        .map_err(|e| Error::StandardIo {
-            action: StandardIoAction::Write,
-            err: Some(e.kind()),
-        })?
+    });
+
+    let all_inverse_deps = inverse_dep_packages
+        .into_iter()
+        .chain(std::iter::once(inverse_root_deps.clone()))
+        .collect_vec();
+
+    type InverseDep = (EcoString, Vec<(EcoString, hexpm::version::Range)>, Version);
+    fn traverse<W: std::io::Write>(
+        buffer: &mut W,
+        dep_name: &str,
+        package: &InverseDep,
+        path: &mut Vec<(EcoString, Version)>,
+        all_inverse_deps: &[InverseDep],
+    ) -> Result<()> {
+        let (name, deps, version) = package;
+        path.push((name.clone(), version.clone()));
+        for (name, req) in deps {
+            if name == dep_name {
+                for (package_name, package_version) in &*path {
+                    write!(buffer, "{package_name}={package_version} > ").map_err(|e| {
+                        Error::StandardIo {
+                            action: StandardIoAction::Write,
+                            err: Some(e.kind()),
+                        }
+                    })?
+                }
+                writeln!(buffer, "{dep_name} : {}", req.as_str()).map_err(|e| {
+                    Error::StandardIo {
+                        action: StandardIoAction::Write,
+                        err: Some(e.kind()),
+                    }
+                })?
+            } else {
+                traverse(
+                    buffer,
+                    dep_name,
+                    all_inverse_deps
+                        .iter()
+                        .find(|(pn, _, _)| pn == name)
+                        .expect("to find dependency"),
+                    path,
+                    all_inverse_deps,
+                )?;
+            }
+        }
+        let _ = path.pop();
+        Ok(())
     }
 
+    traverse(
+        &mut buffer,
+        dep_name,
+        &inverse_root_deps,
+        &mut vec![],
+        &all_inverse_deps,
+    )?;
     Ok(())
 }
 
