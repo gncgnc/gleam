@@ -179,32 +179,45 @@ fn list_inverse_deps_with_required_version<W: std::io::Write>(
         version: config.version.clone(),
     };
 
+    fn from_io_error(io_error: std::io::Error) -> Error {
+        Error::StandardIo {
+            action: StandardIoAction::Write,
+            err: Some(io_error.kind()),
+        }
+    }
+
+    let to_fetch = manifest
+        .packages
+        .into_iter()
+        .filter(|mp| matches!(mp.source, ManifestPackageSource::Hex { .. }));
+    writeln!(
+        buffer,
+        "Fetching {} package releases",
+        to_fetch.clone().count()
+    )
+    .map_err(from_io_error)?;
     // fetch package releases from hex for version requirements
-    let hex_packages = runtime.block_on(future::try_join_all(
-        manifest
-            .packages
-            .into_iter()
-            .filter(|mp| matches!(mp.source, ManifestPackageSource::Hex { .. }))
-            .map(|package| async move {
-                let hex_config = hexpm::Config::new();
-                hex::get_package_release(
-                    &package.name,
-                    &package.version,
-                    &hex_config,
-                    &HttpClient::new(),
-                )
-                .await
-                .map(|release| Package {
-                    name: package.name,
-                    requirements: release
-                        .requirements
-                        .into_iter()
-                        .map(|(name, dep)| (name.into(), dep.requirement))
-                        .collect(),
-                    version: release.version,
-                })
-            }),
-    ))?;
+    let hex_packages =
+        runtime.block_on(future::try_join_all(to_fetch.map(|package| async move {
+            let hex_config = hexpm::Config::new();
+            hex::get_package_release(
+                &package.name,
+                &package.version,
+                &hex_config,
+                &HttpClient::new(),
+            )
+            .await
+            .map(|release| Package {
+                name: package.name,
+                requirements: release
+                    .requirements
+                    .into_iter()
+                    .map(|(name, dep)| (name.into(), dep.requirement))
+                    .collect(),
+                version: release.version,
+            })
+        })))?;
+    writeln!(buffer, "Fetched package releases").map_err(from_io_error)?;
 
     let packages = hex_packages
         .into_iter()
@@ -217,14 +230,10 @@ fn list_inverse_deps_with_required_version<W: std::io::Write>(
         requirement: &hexpm::version::Range,
         dep_name: &str,
     ) -> Result<()> {
-        let err = |io_error: std::io::Error| Error::StandardIo {
-            action: StandardIoAction::Write,
-            err: Some(io_error.kind()),
-        };
         for (package_name, package_version) in path {
-            write!(buffer, "{package_name} {package_version} > ").map_err(err)?
+            write!(buffer, "{package_name} {package_version} > ").map_err(from_io_error)?
         }
-        writeln!(buffer, "{dep_name} : {}", requirement.as_str()).map_err(err)
+        writeln!(buffer, "{dep_name} : {}", requirement.as_str()).map_err(from_io_error)
     }
 
     fn traverse<W: std::io::Write>(
